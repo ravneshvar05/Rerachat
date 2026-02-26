@@ -1,0 +1,16 @@
+# LLM
+groq
+
+# Vector store + embeddings
+chromadb
+sentence-transformers
+
+# Environment
+python-dotenv
+pydantic-settings
+
+# UI
+streamlit
+
+# Utilities
+loguru
