@@ -59,6 +59,15 @@ def _build_sql_filter(q: ParsedQuery) -> tuple[str, list]:
         conditions.append("LOWER(p.city) LIKE ?")
         params.append(f"%{q.city.lower()}%")
 
+    if q.neighbourhood:
+        # Check neighbourhood for the keyword
+        conditions.append("LOWER(p.neighbourhood) LIKE ?")
+        params.append(f"%{q.neighbourhood.lower()}%")
+
+    if q.project_name:
+        conditions.append("LOWER(p.project_name) LIKE ?")
+        params.append(f"%{q.project_name.lower()}%")
+
     if q.bhk:
         conditions.append("u.bhk = ?")
         params.append(q.bhk)

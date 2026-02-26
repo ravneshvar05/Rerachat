@@ -21,6 +21,8 @@ class ParsedQuery:
     """Structured representation of what the user is looking for."""
     # Hard filters (exact match in SQLite)
     city: Optional[str] = None
+    neighbourhood: Optional[str] = None
+    project_name: Optional[str] = None
     bhk: Optional[int] = None
     property_type: Optional[str] = None    # APARTMENT / VILLA / ROW_HOUSE / TENEMENT
     min_area_sqft: Optional[float] = None
@@ -53,11 +55,14 @@ You are a real estate assistant helping users find the right home.
 Your job is to extract structured search filters from the user's message.
 
 IMPORTANT RULES:
-- If the user has NOT specified BHK count, property type (apartment/villa/etc), or city,
+- If the user has NOT specified a specific project by name, AND has NOT specified BHK count, property type (apartment/villa/etc), or city,
   set needs_clarification = true and write a friendly clarification_question asking for the missing info.
+- If the user IS asking about a specific project by name, extract `project_name`. In this case, DO NOT require BHK, property type, or city, and set needs_clarification = false.
 - If you have enough info to search, set needs_clarification = false.
 - property_type must be one of: APARTMENT, VILLA, ROW_HOUSE, TENEMENT, PENTHOUSE, null
 - city: extract city name if mentioned, else null
+- neighbourhood: extract neighbourhood or specific area if mentioned (e.g., 'Vinzol', 'Bopal'), else null
+- project_name: extract specific project name if mentioned, else null
 - bhk: integer only (1, 2, 3, 4, 5), null if not mentioned
 - semantic_query: a clean English sentence combining all user preferences for semantic search
 - All boolean flags default to false unless user explicitly mentions them
@@ -66,6 +71,8 @@ IMPORTANT RULES:
 JSON schema to return:
 {
   "city": string | null,
+  "neighbourhood": string | null,
+  "project_name": string | null,
   "bhk": integer | null,
   "property_type": string | null,
   "min_area_sqft": float | null,

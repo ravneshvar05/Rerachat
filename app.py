@@ -191,7 +191,8 @@ st.markdown("""
     }
 
     /* Hide Streamlit branding */
-    header, #MainMenu, footer { visibility: hidden !important; }
+    #MainMenu, footer { visibility: hidden !important; }
+    header { background: transparent !important; }
 
     /* Custom Scrollbar */
     ::-webkit-scrollbar { width: 8px; }
