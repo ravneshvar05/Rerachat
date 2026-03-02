@@ -1,84 +1,35 @@
 """
-ingest.py — Reads all brochure JSONs and populates:
-  1. SQLite  → structured, filterable data (projects + units tables)
-  2. ChromaDB → semantic vector embeddings (one document per unit)
+ingest.py — Batch ingestion from brochure JSONs into:
+  1. SQLite   → projects, project_landmarks, project_amenities, units, rooms tables
+  2. ChromaDB → one embedding per unit (description + context)
 
-Run this every time you add new JSONs to the output folder.
-Only NEW projects (not already in DB) will be inserted.
+Features:
+  - Idempotent: skips already-ingested project_ids
+  - Batch ChromaDB upserts (INGEST_BATCH_SIZE at a time)
+  - Handles all JSON field inconsistencies (entrance_Facing vs entrance_facing, etc.)
+  - Computes all boolean flags and key room metrics during ingestion
+  - Rebuilds FTS5 index after each project
 
 Usage:
-    python ingest.py
+    python ingest.py              # ingest new files only
+    python ingest.py --force      # re-ingest everything (clears DB first)
+    python ingest.py --dry-run    # validate JSONs without writing to DB
 """
 
+import argparse
 import json
 import sqlite3
+import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import chromadb
 from chromadb.utils import embedding_functions
+
 from config import settings
 from logger import logger
-
-
-# ─── SQLite Setup ─────────────────────────────────────────────────────────────
-
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(settings.sqlite_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # better concurrent reads
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-def create_tables(conn: sqlite3.Connection) -> None:
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS projects (
-            project_id          TEXT PRIMARY KEY,
-            project_name        TEXT,
-            developer_name      TEXT,
-            city                TEXT,
-            neighbourhood       TEXT,
-            nearby_landmarks    TEXT,   -- joined string of landmarks
-            rera_number         TEXT,
-            project_status      TEXT,
-            possession_date     TEXT,
-            amenities_text      TEXT,   -- joined string for FTS
-            has_clubhouse       INTEGER,
-            has_pool            INTEGER,
-            has_park            INTEGER,
-            has_sports_courts   INTEGER,
-            has_parking         INTEGER,
-            total_units         INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS units (
-            unit_id             TEXT PRIMARY KEY,
-            project_id          TEXT REFERENCES projects(project_id),
-            unit_type           TEXT,
-            property_type       TEXT,       -- APARTMENT / VILLA / ROW_HOUSE ...
-            bhk                 INTEGER,
-            carpet_area_sqft    REAL,
-            super_builtup_sqft  REAL,
-            balcony_area_sqft   REAL,
-            wash_area_sqft      REAL,
-            applicable_buildings TEXT,      -- stored as comma-separated string
-            description         TEXT,
-            rooms_json          TEXT,       -- raw JSON generic room details
-            -- derived room flags (for fast filtering)
-            has_pooja_room      INTEGER DEFAULT 0,
-            has_study_room      INTEGER DEFAULT 0,
-            has_terrace         INTEGER DEFAULT 0,
-            has_servant_room    INTEGER DEFAULT 0,
-            has_garden          INTEGER DEFAULT 0,
-            has_home_theatre    INTEGER DEFAULT 0,
-            has_gym             INTEGER DEFAULT 0,
-            attached_bathrooms  INTEGER DEFAULT 0,
-            total_rooms         INTEGER DEFAULT 0
-        );
-    """)
-    conn.commit()
-    logger.info("SQLite tables ready.")
+from schema import create_all_tables, get_connection
 
 
 # ─── ChromaDB Setup ───────────────────────────────────────────────────────────
@@ -86,106 +37,178 @@ def create_tables(conn: sqlite3.Connection) -> None:
 def get_chroma_collection() -> chromadb.Collection:
     client = chromadb.PersistentClient(path=str(settings.chroma_path))
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
+        model_name=settings.CHROMA_EMBED_MODEL
     )
     collection = client.get_or_create_collection(
         name=settings.CHROMA_COLLECTION_NAME,
         embedding_function=embed_fn,
         metadata={"hnsw:space": "cosine"},
     )
-    logger.info(f"ChromaDB collection '{settings.CHROMA_COLLECTION_NAME}' ready.")
+    logger.info(f"ChromaDB collection '{settings.CHROMA_COLLECTION_NAME}' ready ({collection.count()} docs).")
     return collection
 
 
-# ─── Text Builder (what gets embedded) ───────────────────────────────────────
+# ─── Room Analysis ────────────────────────────────────────────────────────────
 
-def build_unit_text(project: dict, unit: dict) -> str:
-    """Build a rich plain-text description of a unit for embedding."""
-    rooms = unit.get("rooms", [])
-    room_names = ", ".join(r["name"] for r in rooms if r.get("name"))
-    amenities = ", ".join(project.get("amenities", []))
-    desc = unit.get("description", "") or ""
-    loc = project.get("location", {})
-    society = project.get("society_layout", {})
-
-    text = (
-        f"{unit.get('bhk', '?')} BHK {unit.get('property_type', '')} "
-        f"in {loc.get('city', '')} "
-        f"by {project.get('developer_name', '')} "
-        f"({project.get('project_name', '')}). "
-        f"Unit type: {unit.get('unit_type', '')}. "
-    )
-    if unit.get("super_built_up_area_sqft"):
-        text += f"Super built-up area: {unit['super_built_up_area_sqft']} sqft. "
-    if unit.get("carpet_area_sqft"):
-        text += f"Carpet area: {unit['carpet_area_sqft']} sqft. "
-    if desc:
-        text += f"{desc} "
-    if room_names:
-        text += f"Rooms: {room_names}. "
-    if amenities:
-        text += f"Project amenities: {amenities}. "
-    if society.get("description"):
-        text += f"{society['description']}"
-    return text.strip()
-
-
-# ─── Room Flag Extraction ─────────────────────────────────────────────────────
-
-ROOM_FLAGS = {
-    "has_pooja_room":    {"POOJA_ROOM"},
-    "has_study_room":    {"STUDY_ROOM"},
-    "has_terrace":       {"TERRACE"},
-    "has_servant_room":  {"SERVANT_ROOM"},
-    "has_garden":        {"OTHER"},         # detected by name keyword below
-    "has_home_theatre":  {"OTHER"},
-    "has_gym":           {"OTHER"},
+ROOM_TYPE_FLAGS = {
+    "POOJA_ROOM":   "has_pooja_room",
+    "STUDY_ROOM":   "has_study_room",
+    "TERRACE":      "has_terrace",
+    "SERVANT_ROOM": "has_servant_room",
+    "DRESSING_ROOM":"has_dressing_room",
+    "STORE_ROOM":   "has_store_room",
+    "COURTYARD":    "has_courtyard",
+    "LOBBY":        "has_lobby",
+    "BALCONY":      "has_balcony",
 }
 
-GARDEN_KEYWORDS   = {"garden", "courtyard"}
-THEATRE_KEYWORDS  = {"theatre", "theater", "home theatre"}
-GYM_KEYWORDS      = {"gym", "gymnasium"}
+NAME_KEYWORD_FLAGS = {
+    "has_garden":       {"garden", "courtyard"},
+    "has_home_theatre": {"theatre", "theater", "home theater"},
+    "has_gym":          {"gym", "gymnasium", "home gym"},
+}
 
 
-def extract_room_flags(rooms: list) -> dict:
-    flags = {k: 0 for k in ROOM_FLAGS}
-    attached = 0
+def analyze_rooms(rooms: list) -> dict:
+    """Extract all derived metrics from a unit's room list."""
+    flags = {v: 0 for v in ROOM_TYPE_FLAGS.values()}
+    flags.update({"has_garden": 0, "has_home_theatre": 0, "has_gym": 0})
+
+    total_rooms = len(rooms)
+    total_bedrooms = 0
+    total_toilets = 0
+    attached_bathrooms = 0
+    bedroom_areas = []
+    drawing_room_sqft = None
+    kitchen_sqft = None
+
     for room in rooms:
-        rt = room.get("room_type", "")
-        name = (room.get("name") or "").lower()
+        rt = (room.get("room_type") or "").upper()
+        name_lower = (room.get("name") or "").lower()
+        area = room.get("area_sqft")
 
-        if rt == "POOJA_ROOM":
-            flags["has_pooja_room"] = 1
-        elif rt == "STUDY_ROOM":
-            flags["has_study_room"] = 1
-        elif rt == "TERRACE":
-            flags["has_terrace"] = 1
-        elif rt == "SERVANT_ROOM":
-            flags["has_servant_room"] = 1
+        # ── room_type flags ──
+        if rt in ROOM_TYPE_FLAGS:
+            flags[ROOM_TYPE_FLAGS[rt]] = 1
 
-        # name-based detection for OTHER types
-        if any(k in name for k in GARDEN_KEYWORDS):
-            flags["has_garden"] = 1
-        if any(k in name for k in THEATRE_KEYWORDS):
-            flags["has_home_theatre"] = 1
-        if any(k in name for k in GYM_KEYWORDS):
-            flags["has_gym"] = 1
+        # ── name keyword flags ──
+        for flag, keywords in NAME_KEYWORD_FLAGS.items():
+            if any(kw in name_lower for kw in keywords):
+                flags[flag] = 1
 
-        # count attached bathrooms
-        if rt == "BEDROOM" and room.get("attached_bathroom"):
-            attached += 1
+        # ── special cases: HOME THEATRE / HOME GYM in name with OTHER type ──
+        if rt == "OTHER":
+            if any(kw in name_lower for kw in NAME_KEYWORD_FLAGS["has_home_theatre"]):
+                flags["has_home_theatre"] = 1
+            if any(kw in name_lower for kw in NAME_KEYWORD_FLAGS["has_gym"]):
+                flags["has_gym"] = 1
 
-    flags["attached_bathrooms"] = attached
-    flags["total_rooms"] = len(rooms)
-    return flags
+        # ── room type counters ──
+        if rt == "BEDROOM":
+            total_bedrooms += 1
+            if area:
+                bedroom_areas.append(area)
+            if room.get("attached_bathroom"):
+                attached_bathrooms += 1
+
+        elif rt in ("TOILET", "BATHROOM", "WC"):
+            total_toilets += 1
+
+        elif rt == "DRAWING_ROOM" and area and drawing_room_sqft is None:
+            drawing_room_sqft = area
+
+        elif rt == "KITCHEN" and area and kitchen_sqft is None:
+            kitchen_sqft = area
+
+    master_bedroom_sqft = max(bedroom_areas) if bedroom_areas else None
+
+    return {
+        **flags,
+        "total_rooms":        total_rooms,
+        "total_bedrooms":     total_bedrooms,
+        "total_toilets":      total_toilets,
+        "attached_bathrooms": attached_bathrooms,
+        "master_bedroom_sqft":master_bedroom_sqft,
+        "drawing_room_sqft":  drawing_room_sqft,
+        "kitchen_sqft":       kitchen_sqft,
+    }
 
 
-# ─── Ingestion Logic ──────────────────────────────────────────────────────────
+# ─── Embedding Text Builder ───────────────────────────────────────────────────
 
-def is_project_ingested(conn: sqlite3.Connection, project_id: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM projects WHERE project_id = ?", (project_id,)
-    ).fetchone()
+def build_unit_embedding_text(project: dict, unit: dict, amenities: list, landmarks: list) -> str:
+    """Build a rich, descriptive text for ChromaDB embedding of a unit."""
+    loc = project.get("location", {})
+    society = project.get("society_layout", {}) or {}
+
+    parts = []
+
+    # Identity
+    bhk = unit.get("bhk")
+    ptype = unit.get("property_type", "")
+    city = loc.get("city", "")
+    neighbourhood = loc.get("neighbourhood", "")
+    proj_name = project.get("project_name", "")
+    developer = project.get("developer_name", "")
+
+    parts.append(f"{bhk} BHK {ptype} in {neighbourhood}, {city} by {developer} ({proj_name}).")
+
+    # Unit description
+    desc = unit.get("description") or ""
+    if desc:
+        parts.append(desc)
+
+    # Areas
+    sba = unit.get("super_built_up_area_sqft") or unit.get("super_builtup_sqft")
+    ca = unit.get("carpet_area_sqft")
+    if sba:
+        parts.append(f"Super built-up area: {sba} sqft.")
+    if ca:
+        parts.append(f"Carpet area: {ca} sqft.")
+
+    # Room highlights (special rooms only — not toilets/kitchens)
+    rooms = unit.get("rooms", [])
+    special_rooms = [
+        r.get("name") for r in rooms
+        if r.get("room_type") in (
+            "POOJA_ROOM", "STUDY_ROOM", "TERRACE", "SERVANT_ROOM",
+            "DRESSING_ROOM", "STORE_ROOM", "COURTYARD", "BALCONY",
+        ) or any(kw in (r.get("name") or "").lower()
+                 for kw in ("garden","theatre","theater","gym","gymnasium"))
+    ]
+    if special_rooms:
+        parts.append(f"Special rooms: {', '.join(r for r in special_rooms if r)}.")
+
+    # Unit type (villa variant name etc.)
+    unit_type = unit.get("unit_type", "")
+    if unit_type and unit_type not in (f"{bhk} BHK",):
+        parts.append(f"Unit variant: {unit_type}.")
+
+    # Entrance facing
+    facing = unit.get("entrance_Facing") or unit.get("entrance_facing")
+    if facing:
+        parts.append(f"Entrance facing: {facing}.")
+
+    # Project amenities
+    if amenities:
+        parts.append(f"Project amenities: {'; '.join(amenities)}.")
+
+    # Society description
+    soc_desc = society.get("description", "")
+    if soc_desc:
+        parts.append(soc_desc)
+
+    # Nearby landmarks (most important ones, first 8)
+    if landmarks:
+        parts.append(f"Nearby: {', '.join(landmarks[:8])}.")
+
+    return " ".join(parts)
+
+
+# ─── Project Ingestion ────────────────────────────────────────────────────────
+
+def is_ingested(conn: sqlite3.Connection, project_id: str) -> bool:
+    row = conn.execute("SELECT 1 FROM projects WHERE project_id = ?", (project_id,)).fetchone()
     return row is not None
 
 
@@ -194,151 +217,261 @@ def ingest_project(
     collection: chromadb.Collection,
     data: dict,
     source_file: str,
-) -> None:
+    dry_run: bool = False,
+) -> int:
+    """Ingest one project. Returns number of units ingested."""
+
     project_id = data.get("project_id") or str(uuid.uuid4())
+    loc = data.get("location", {}) or {}
+    society = data.get("society_layout", {}) or {}
+    amenities_list = data.get("amenities", []) or []
+    landmarks_list = (loc.get("nearby_landmarks") or [])
 
-    if is_project_ingested(conn, project_id):
-        logger.info(f"  ↳ Already ingested: {project_id} — skipping.")
-        return
+    if dry_run:
+        logger.info(f"  [DRY-RUN] Would ingest: {data.get('project_name')} ({len(data.get('units', []))} units)")
+        return len(data.get("units", []))
 
-    loc = data.get("location", {})
-    society = data.get("society_layout", {})
-    amenities_text = " | ".join(data.get("amenities", []))
+    now = datetime.now(timezone.utc).isoformat()
 
-    # ── Insert project row ──
+    # ── Insert project ──
     conn.execute(
-        """INSERT INTO projects VALUES (
-            :project_id, :project_name, :developer_name, :city, :neighbourhood,
-            :nearby_landmarks, :rera_number, :project_status, :possession_date, :amenities_text,
-            :has_clubhouse, :has_pool, :has_park, :has_sports_courts,
-            :has_parking, :total_units
+        """INSERT OR REPLACE INTO projects VALUES (
+            :project_id, :project_name, :developer_name, :rera_number, :project_status,
+            :possession_date, :city, :neighbourhood, :address, :pin_code,
+            :has_clubhouse, :has_pool, :has_park, :has_sports_courts, :has_parking,
+            :has_commercial_shops, :total_buildings, :total_villas, :society_description,
+            :road_widths, :source_file, :ingested_at
         )""",
         {
-            "project_id":      project_id,
-            "project_name":    data.get("project_name"),
-            "developer_name":  data.get("developer_name"),
-            "city":            loc.get("city"),
-            "neighbourhood":   loc.get("neighbourhood"),
-            "nearby_landmarks": ", ".join(loc.get("nearby_landmarks") or []),
-            "rera_number":     data.get("rera_registration_number"),
-            "project_status":  data.get("project_status"),
-            "possession_date": data.get("possession_date"),
-            "amenities_text":  amenities_text,
-            "has_clubhouse":   int(bool(society.get("has_clubhouse"))),
-            "has_pool":        int(bool(society.get("has_swimming_pool"))),
-            "has_park":        int(bool(society.get("has_park_or_garden"))),
-            "has_sports_courts": int(bool(society.get("has_sports_courts"))),
-            "has_parking":     int(bool(society.get("has_parking_area"))),
-            "total_units":     society.get("total_units_in_project"),
+            "project_id":          project_id,
+            "project_name":        data.get("project_name"),
+            "developer_name":      data.get("developer_name"),
+            "rera_number":         data.get("rera_registration_number"),
+            "project_status":      data.get("project_status"),
+            "possession_date":     data.get("possession_date"),
+            "city":                loc.get("city"),
+            "neighbourhood":       loc.get("neighbourhood"),
+            "address":             loc.get("address"),
+            "pin_code":            loc.get("pin_code"),
+            "has_clubhouse":       int(bool(society.get("has_clubhouse"))),
+            "has_pool":            int(bool(society.get("has_swimming_pool"))),
+            "has_park":            int(bool(society.get("has_park_or_garden"))),
+            "has_sports_courts":   int(bool(society.get("has_sports_courts"))),
+            "has_parking":         int(bool(society.get("has_parking_area"))),
+            "has_commercial_shops":int(bool(society.get("commercial_shops_included"))),
+            "total_buildings":     society.get("total_apartment_blocks"),
+            "total_villas":        society.get("total_independent_villas_or_tenements"),
+            "society_description": society.get("description"),
+            "road_widths":         " | ".join(society.get("road_width_details") or []),
+            "source_file":         source_file,
+            "ingested_at":         now,
         },
     )
 
-    # ── Insert units + add to ChromaDB ──
-    units = data.get("units", [])
+    # Remove existing child rows (for re-ingestion)
+    conn.execute("DELETE FROM project_landmarks WHERE project_id = ?", (project_id,))
+    conn.execute("DELETE FROM project_amenities WHERE project_id = ?", (project_id,))
+
+    # ── Insert landmarks ──
+    for landmark in landmarks_list:
+        if landmark and landmark.strip():
+            conn.execute(
+                "INSERT INTO project_landmarks (project_id, landmark_name) VALUES (?, ?)",
+                (project_id, landmark.strip()),
+            )
+
+    # ── Insert amenities ──
+    for amenity in amenities_list:
+        if amenity and amenity.strip():
+            conn.execute(
+                "INSERT INTO project_amenities (project_id, amenity) VALUES (?, ?)",
+                (project_id, amenity.strip()),
+            )
+
+    # ── Update FTS5 index ──
+    landmarks_text = " ".join(landmarks_list)
+    amenities_text = " ".join(amenities_list)
+
+    conn.execute("DELETE FROM projects_fts WHERE project_id = ?", (project_id,))
+    conn.execute(
+        """INSERT INTO projects_fts (project_id, project_name, developer_name,
+           city, neighbourhood, address, society_description, landmarks_text, amenities_text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            project_id,
+            data.get("project_name", ""),
+            data.get("developer_name", ""),
+            loc.get("city", ""),
+            loc.get("neighbourhood", ""),
+            loc.get("address", ""),
+            society.get("description", ""),
+            landmarks_text,
+            amenities_text,
+        ),
+    )
+
+    # ── Insert units + rooms ──
+    units = data.get("units", []) or []
     chroma_docs, chroma_meta, chroma_ids = [], [], []
 
     for idx, unit in enumerate(units):
-        # ensure unique ID by appending loop index if needed, because sometimes unit_type is duplicated
-        unit_id = f"{project_id}__{unit.get('unit_type', uuid.uuid4())}_{idx}"
-        # make safe ID for ChromaDB (no spaces or special chars)
+        # Normalize entrance_facing key inconsistency from gemini.py schema
+        facing = unit.get("entrance_Facing") or unit.get("entrance_facing")
+
+        unit_id = f"{project_id}__{idx}"
         unit_id_safe = unit_id.replace(" ", "_").replace("/", "-")
 
-        flags = extract_room_flags(unit.get("rooms", []))
+        rooms = unit.get("rooms", []) or []
+        metrics = analyze_rooms(rooms)
+
+        # Remove existing unit rows (for re-ingestion)
+        conn.execute("DELETE FROM rooms WHERE unit_id = ?", (unit_id_safe,))
+        conn.execute("DELETE FROM units WHERE unit_id = ?", (unit_id_safe,))
 
         conn.execute(
-            """INSERT OR IGNORE INTO units VALUES (
-                :unit_id, :project_id, :unit_type, :property_type, :bhk,
-                :carpet_area_sqft, :super_builtup_sqft, :balcony_area_sqft,
-                :wash_area_sqft, :applicable_buildings, :description, :rooms_json,
-                :has_pooja_room, :has_study_room, :has_terrace,
-                :has_servant_room, :has_garden, :has_home_theatre, :has_gym,
-                :attached_bathrooms, :total_rooms
+            """INSERT INTO units VALUES (
+                :unit_id, :project_id, :unit_type, :property_type, :bhk, :entrance_facing,
+                :description, :carpet_area_sqft, :super_builtup_sqft, :balcony_area_sqft,
+                :wash_area_sqft, :applicable_buildings,
+                :total_rooms, :total_bedrooms, :total_toilets, :attached_bathrooms,
+                :master_bedroom_sqft, :drawing_room_sqft, :kitchen_sqft,
+                :has_pooja_room, :has_study_room, :has_terrace, :has_servant_room,
+                :has_garden, :has_home_theatre, :has_gym, :has_dressing_room,
+                :has_store_room, :has_courtyard, :has_lobby, :has_balcony
             )""",
             {
-                "unit_id":             unit_id_safe,
-                "project_id":          project_id,
-                "unit_type":           unit.get("unit_type"),
-                "property_type":       unit.get("property_type"),
-                "bhk":                 unit.get("bhk"),
-                "carpet_area_sqft":    unit.get("carpet_area_sqft"),
-                "super_builtup_sqft":  unit.get("super_built_up_area_sqft"),
-                "balcony_area_sqft":   unit.get("balcony_area_sqft"),
-                "wash_area_sqft":      unit.get("wash_area_sqft"),
+                "unit_id":            unit_id_safe,
+                "project_id":         project_id,
+                "unit_type":          unit.get("unit_type"),
+                "property_type":      unit.get("property_type"),
+                "bhk":                unit.get("bhk"),
+                "entrance_facing":    facing,
+                "description":        unit.get("description"),
+                "carpet_area_sqft":   unit.get("carpet_area_sqft"),
+                "super_builtup_sqft": unit.get("super_built_up_area_sqft"),
+                "balcony_area_sqft":  unit.get("balcony_area_sqft"),
+                "wash_area_sqft":     unit.get("wash_area_sqft"),
                 "applicable_buildings": ",".join(unit.get("applicable_buildings") or []),
-                "description":         unit.get("description"),
-                "rooms_json":          json.dumps(unit.get("rooms", [])),
-                **flags,
+                **metrics,
             },
         )
 
-        # Build the text that gets embedded
-        text = build_unit_text(data, unit)
+        # ── Insert rooms ──
+        for room in rooms:
+            conn.execute(
+                """INSERT INTO rooms (unit_id, project_id, name, room_type, length, width,
+                   area_sqft, floor_level, attached_bathroom, has_balcony_access)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    unit_id_safe,
+                    project_id,
+                    room.get("name"),
+                    room.get("room_type"),
+                    room.get("length"),
+                    room.get("width"),
+                    room.get("area_sqft"),
+                    room.get("floor_level"),
+                    int(bool(room.get("attached_bathroom"))) if room.get("attached_bathroom") is not None else None,
+                    int(bool(room.get("has_balcony_access"))) if room.get("has_balcony_access") is not None else None,
+                ),
+            )
+
+        # ── Build ChromaDB text ──
+        text = build_unit_embedding_text(data, unit, amenities_list, landmarks_list)
         chroma_docs.append(text)
         chroma_ids.append(unit_id_safe)
         chroma_meta.append({
             "project_id":    project_id,
             "unit_id":       unit_id_safe,
             "project_name":  data.get("project_name", ""),
-            "city":          loc.get("city", ""),
+            "city":          loc.get("city", "") or "",
             "bhk":           unit.get("bhk") or 0,
-            "property_type": unit.get("property_type", ""),
-            "area_sqft":     unit.get("super_built_up_area_sqft") or 0.0,
+            "property_type": (unit.get("property_type") or "").upper(),
+            "area_sqft":     float(unit.get("super_built_up_area_sqft") or 0),
         })
 
-    # Add to ChromaDB in one batch
-    if chroma_docs:
+    # ── Batch upsert to ChromaDB ──
+    batch_size = settings.INGEST_BATCH_SIZE
+    for i in range(0, len(chroma_docs), batch_size):
         collection.upsert(
-            documents=chroma_docs,
-            metadatas=chroma_meta,
-            ids=chroma_ids,
+            documents=chroma_docs[i : i + batch_size],
+            metadatas=chroma_meta[i : i + batch_size],
+            ids=chroma_ids[i : i + batch_size],
         )
 
     conn.commit()
-    logger.success(f"  ✓ Ingested: {data.get('project_name')} — {len(units)} unit(s)")
+    return len(units)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def run_ingestion() -> None:
+def run_ingestion(force: bool = False, dry_run: bool = False) -> None:
     json_dir = settings.JSON_OUTPUT_DIR
-    json_files = list(json_dir.glob("*.json"))
+    json_files = sorted(json_dir.glob("*.json"))
 
     if not json_files:
-        logger.warning(f"No JSON files found in {json_dir}. Nothing to ingest.")
+        logger.warning(f"No JSON files found in {json_dir}.")
         return
 
     logger.info(f"Found {len(json_files)} JSON file(s) in '{json_dir}'")
 
-    conn = get_db_connection()
-    collection = get_chroma_collection()
-    create_tables(conn)
+    conn = get_connection()
+    create_all_tables(conn)
 
-    ingested, skipped = 0, 0
-    for json_file in json_files:
-        logger.info(f"Processing: {json_file.name}")
+    if force and not dry_run:
+        logger.warning("--force: clearing existing data.")
+        conn.executescript("""
+            DELETE FROM rooms;
+            DELETE FROM units;
+            DELETE FROM project_landmarks;
+            DELETE FROM project_amenities;
+            DELETE FROM projects;
+            DELETE FROM projects_fts;
+        """)
+        conn.commit()
+
+    collection = get_chroma_collection()
+
+    ingested, skipped, failed = 0, 0, 0
+    total_units = 0
+
+    for i, json_file in enumerate(json_files, 1):
+        logger.info(f"[{i}/{len(json_files)}] {json_file.name}")
         try:
             data = json.loads(json_file.read_text(encoding="utf-8"))
             project_id = data.get("project_id", "")
 
-            if is_project_ingested(conn, project_id):
-                logger.info(f"  ↳ Already ingested: {json_file.name} — skipping.")
+            if not force and is_ingested(conn, project_id):
+                logger.info(f"  ↳ Already ingested — skipping.")
                 skipped += 1
-            else:
-                ingest_project(conn, collection, data, json_file.name)
-                ingested += 1
+                continue
+
+            n = ingest_project(conn, collection, data, json_file.name, dry_run=dry_run)
+            total_units += n
+            ingested += 1
+            logger.success(f"  ✓ {data.get('project_name')} — {n} unit(s)")
 
         except Exception as e:
-            logger.error(f"  ✗ Failed to process {json_file.name}: {e}")
+            logger.error(f"  ✗ Failed: {e}")
+            failed += 1
 
     conn.close()
+    separator = "─" * 55
     logger.info(
-        f"\n{'─'*50}\n"
-        f"Ingestion complete: {ingested} new, {skipped} skipped.\n"
-        f"SQLite  → {settings.sqlite_path}\n"
-        f"ChromaDB → {settings.chroma_path}\n"
-        f"{'─'*50}"
+        f"\n{separator}\n"
+        f"  Ingestion complete{'  [DRY-RUN]' if dry_run else ''}:\n"
+        f"  ✓ {ingested} new  |  ↷ {skipped} skipped  |  ✗ {failed} failed\n"
+        f"  Total units stored: {total_units}\n"
+        f"  SQLite  → {settings.sqlite_path}\n"
+        f"  ChromaDB → {settings.chroma_path}\n"
+        f"{separator}"
     )
 
 
 if __name__ == "__main__":
-    run_ingestion()
+    parser = argparse.ArgumentParser(description="Ingest brochure JSONs into the RERA database.")
+    parser.add_argument("--force",   action="store_true", help="Re-ingest all files (clears DB first)")
+    parser.add_argument("--dry-run", action="store_true", help="Validate JSONs without writing to DB")
+    args = parser.parse_args()
+
+    run_ingestion(force=args.force, dry_run=args.dry_run)

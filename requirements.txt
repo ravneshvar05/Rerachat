@@ -1,16 +1,17 @@
-# LLM
+# ── LLM ──────────────────────────────────────────────────────────────────────
+google-genai
 groq
 
-# Vector store + embeddings
+# ── Vector store + embeddings ─────────────────────────────────────────────────
 chromadb
 sentence-transformers
 
-# Environment
+# ── Environment & Config ──────────────────────────────────────────────────────
 python-dotenv
 pydantic-settings
 
-# UI
+# ── UI ────────────────────────────────────────────────────────────────────────
 streamlit
 
-# Utilities
+# ── Utilities ─────────────────────────────────────────────────────────────────
 loguru

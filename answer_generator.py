@@ -1,138 +1,282 @@
 """
-answer_generator.py — Uses Groq LLM to generate a natural language response
-based on the search results and the user's original query.
+answer_generator.py — Uses Gemini Flash to generate a natural language answer
+based on search results and the detected query type.
+
+Query-type-aware:
+  SEARCH    → Friendly scannable list with project highlights
+  AGGREGATE → Summary statistics ("There are 47 3-BHK apartments...")
+  COMPARE   → Side-by-side comparison of 2 named projects
+  DETAIL    → Rich deep-dive: all units, rooms, full amenities
 """
 
 import json
-from groq import Groq
+from google import genai
+from google.genai import types as gtypes
+
 from config import settings
 from logger import logger
 
 
-_SYSTEM_PROMPT = """\
-You are a friendly and knowledgeable real estate assistant helping buyers find their ideal home in India.
+_BASE_SYSTEM = """\
+You are a warm, knowledgeable real estate advisor helping Indian home buyers find their ideal property.
+You speak naturally and helpfully, like an expert agent who knows every project deeply.
 
-You will be given:
-1. The user's query
-2. A list of matching unique real estate projects from our database, each containing one or more matching unit variations.
-
-Your job is to write a warm, helpful, conversational recommendation.
-
-RULES:
-- Be EXTREMELY concise. For each project, write ONLY 1 to 2 lines maximum.
-- It should look like a quick, scannable suggestion list.
-- If a project has multiple unit variations (e.g. different sizes or configurations for a 3 BHK), MUST explicitly mention the different options available in that single project.
-- Mention the project name, developer, city, and key standout features briefly.
-- Do NOT write a big paragraph at the start. Dive straight into the suggestions after a brief friendly greeting.
-- Do NOT make up information. Only use what is given.
-- Do NOT use markdown headers in your response — keep it conversational but structured.
-- End with an invitation: "Would you like more details about any of these projects?"
+CORE RULES:
+- NEVER make up data. Only use what is given.
+- Do NOT use markdown headers (##, ###) in your response.
+- Use emoji sparingly and only where it adds clarity.
+- Always end with an invitation to ask more.
 """
 
+_PROMPTS = {
+    "SEARCH": _BASE_SYSTEM + """
+You are presenting search results. Format rules:
+- Brief warm opening (1 line max)
+- For each project: 1-2 crisp lines covering: project name, developer, city/neighbourhood, 
+  and the most relevant features for THIS user's query
+- If a project has multiple matching unit variants, mention the options briefly
+- Close with: "Would you like full details on any of these?"
+""",
 
-def _format_results_for_llm(results: list[dict]) -> str:
-    """Format grouped search results into a readable block for the LLM prompt."""
-    if not results:
-        return "No matching projects found."
+    "AGGREGATE": _BASE_SYSTEM + """
+You are answering a statistics/counting question. Format rules:
+- Give a direct, clear answer with the numbers up front
+- Then provide a breakdown (by city, by BHK, by type) if given
+- Keep it factual and scannable
+- Close with: "Want me to filter these further or find specific projects?"
+""",
 
+    "COMPARE": _BASE_SYSTEM + """
+You are comparing two or more real estate projects side-by-side. Format rules:
+- Start with a 1-line summary of the key difference
+- Cover: Location, BHK options, size range, key amenities, special features
+- Clearly recommend which is better for which type of buyer
+- Close with: "Would you like detailed room dimensions for either project?"
+""",
+
+    "DETAIL": _BASE_SYSTEM + """
+You are providing a complete deep-dive on a specific project. Format rules:
+- Project overview: developer, location, society highlights
+- For each unit variant: BHK, size, entrance facing, special rooms
+- Mention room dimensions if available (bedrooms, drawing room)
+- List all amenities and nearby landmarks
+- Close with: "Is there anything specific you'd like to know more about?"
+""",
+}
+
+
+# ─── Result Formatters ────────────────────────────────────────────────────────
+
+def _format_search_context(results: list[dict]) -> str:
     lines = []
     for i, p in enumerate(results, 1):
-        lines.append(f"[Project {i}] {p.get('project_name')} by {p.get('developer_name')}")
+        lines.append(f"\n[Project {i}] {p.get('project_name')} by {p.get('developer_name')}")
         lines.append(f"  Location: {p.get('city')}, {p.get('neighbourhood') or ''}")
-        if p.get("nearby_landmarks"):
-            lines.append(f"  Nearby Landmarks: {p.get('nearby_landmarks')}")
-        
-        # Amenities summary
-        amenities = []
-        if p.get("has_clubhouse"): amenities.append("Clubhouse")
-        if p.get("has_pool"): amenities.append("Pool")
-        if p.get("has_park"): amenities.append("Park")
+        if p.get("project_status") and p["project_status"] != "UNKNOWN":
+            lines.append(f"  Status: {p['project_status']}")
+        if p.get("possession_date"):
+            lines.append(f"  Possession: {p['possession_date']}")
+
+        # Amenities
+        amenities = p.get("amenities", [])
         if amenities:
-            lines.append(f"  Project Amenities: {', '.join(amenities)}")
+            lines.append(f"  Amenities: {', '.join(amenities[:8])}")
 
-        # List all the matching unit variations found in this project
-        lines.append("  Matching Unit Variations:")
-        
-        for j, u in enumerate(p.get("matching_units", []), 1):
-            unit_line = f"    - Variation {j}: {u.get('bhk')} BHK {u.get('property_type')} "
-            
-            # Area info
+        # Landmarks (top 5)
+        landmarks = p.get("nearby_landmarks", [])
+        if landmarks:
+            lines.append(f"  Nearby: {', '.join(landmarks[:5])}")
+
+        # Unit variants
+        units = p.get("matching_units", [])
+        lines.append(f"  Unit Variants ({len(units)}):")
+        for u in units[:6]:  # max 6 variants shown
+            uline = f"    • {u.get('bhk')} BHK {u.get('property_type')}"
             if u.get("super_builtup_sqft"):
-                unit_line += f"| {u['super_builtup_sqft']} sqft "
+                uline += f" | {u['super_builtup_sqft']} sqft"
             elif u.get("carpet_area_sqft"):
-                unit_line += f"| {u['carpet_area_sqft']} sqft "
-                
-            # Unit specific features
-            features = []
-            if u.get("has_pooja_room"):   features.append("Pooja")
-            if u.get("has_study_room"):    features.append("Study")
-            if u.get("has_terrace"):       features.append("Terrace")
-            if u.get("has_garden"):        features.append("Garden")
-            if u.get("has_servant_room"):  features.append("Servant")
-            if features:
-                unit_line += f"| Features: {', '.join(features)}"
-                
-            lines.append(unit_line)
+                uline += f" | carpet {u['carpet_area_sqft']} sqft"
+            if u.get("entrance_facing"):
+                uline += f" | {u['entrance_facing']}-facing"
+            # Special features
+            feats = []
+            for col, label in [
+                ("has_pooja_room","Pooja"), ("has_study_room","Study"),
+                ("has_terrace","Terrace"), ("has_garden","Garden"),
+                ("has_home_theatre","Home Theatre"), ("has_gym","Gym"),
+                ("has_dressing_room","Dressing Room"), ("has_courtyard","Courtyard"),
+                ("has_servant_room","Servant Rm"),
+            ]:
+                if u.get(col):
+                    feats.append(label)
+            if feats:
+                uline += f" | {', '.join(feats)}"
+            lines.append(uline)
 
-            # Extra room dimensions
-            if u.get("rooms_json"):
-                try:
-                    rooms = json.loads(u["rooms_json"])
-                    valid_rooms = []
-                    for r in rooms:
-                        if r.get('name') and r.get('length') and r.get('width'):
-                            valid_rooms.append(f"{r['name']} ({r['length']}x{r['width']})")
-                    if valid_rooms:
-                        lines.append(f"      Rooms: {', '.join(valid_rooms)}")
-                except:
-                    pass
-
-        lines.append("")   # blank line between projects
     return "\n".join(lines)
 
 
+def _format_aggregate_context(agg: dict) -> str:
+    lines = [f"Total matching units: {agg['total_units']}"]
+
+    if agg.get("by_city"):
+        lines.append("\nBreakdown by city:")
+        for row in agg["by_city"]:
+            lines.append(f"  {row['city'] or 'Unknown'}: {row['cnt']} project(s)")
+
+    if agg.get("by_bhk"):
+        lines.append("\nBreakdown by BHK:")
+        for row in agg["by_bhk"]:
+            lines.append(f"  {row['bhk']} BHK: {row['cnt']} unit(s)")
+
+    if agg.get("by_property_type"):
+        lines.append("\nBreakdown by property type:")
+        for row in agg["by_property_type"]:
+            lines.append(f"  {row['property_type']}: {row['cnt']} unit(s)")
+
+    return "\n".join(lines)
+
+
+def _format_detail_context(results: list[dict]) -> str:
+    lines = []
+    for p in results:
+        lines.append(f"PROJECT: {p.get('project_name')} by {p.get('developer_name')}")
+        lines.append(f"Location: {p.get('address') or ''}, {p.get('city')}, {p.get('neighbourhood') or ''}")
+        if p.get("project_status") != "UNKNOWN":
+            lines.append(f"Status: {p.get('project_status')}")
+        if p.get("possession_date"):
+            lines.append(f"Possession: {p.get('possession_date')}")
+        if p.get("rera_number"):
+            lines.append(f"RERA: {p.get('rera_number')}")
+
+        lines.append(f"\nSociety: {p.get('society_description') or 'N/A'}")
+
+        amenities = p.get("amenities", [])
+        if amenities:
+            lines.append(f"Amenities: {', '.join(amenities)}")
+
+        landmarks = p.get("nearby_landmarks", [])
+        if landmarks:
+            lines.append(f"Nearby landmarks: {', '.join(landmarks[:12])}")
+
+        lines.append("\n--- Unit Variants ---")
+        for u in p.get("matching_units", []):
+            lines.append(
+                f"\n  {u.get('unit_type')} | {u.get('bhk')} BHK {u.get('property_type')}"
+                f" | {u.get('super_builtup_sqft') or u.get('carpet_area_sqft') or 'N/A'} sqft"
+                f" | Facing: {u.get('entrance_facing') or 'N/A'}"
+            )
+            if u.get("description"):
+                lines.append(f"  Description: {u['description']}")
+
+            # Rooms
+            rooms = u.get("rooms", [])
+            if rooms:
+                key_rooms = [
+                    r for r in rooms
+                    if r.get("room_type") in (
+                        "BEDROOM", "DRAWING_ROOM", "KITCHEN", "POOJA_ROOM",
+                        "STUDY_ROOM", "TERRACE", "BALCONY", "COURTYARD",
+                    ) or any(kw in (r.get("name") or "").lower()
+                             for kw in ("theatre", "gym", "garden", "dressing"))
+                ]
+                for r in key_rooms[:12]:
+                    dim = ""
+                    if r.get("length") and r.get("width"):
+                        dim = f" ({r['length']} × {r['width']})"
+                    elif r.get("area_sqft"):
+                        dim = f" ({r['area_sqft']} sqft)"
+                    level = f" [{r['floor_level']}]" if r.get("floor_level") else ""
+                    lines.append(f"    - {r.get('name')}{dim}{level}")
+
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ─── Main Generator ──────────────────────────────────────────────────────────
+
 def generate_answer(
     user_query: str,
-    results: list[dict],
+    search_result: dict,
     conversation_history: list[dict] | None = None,
 ) -> str:
     """
-    Generate a natural language recommendation given search results.
+    Generate a natural language answer using Groq (LLaMA 70B).
 
     Args:
-        user_query: The user's original message.
-        results: List of matched unit+project dicts from search.py.
-        conversation_history: Previous chat turns for context.
+        user_query: Original user message.
+        search_result: Output of search.search() → {query_type, results, aggregate}
+        conversation_history: Previous {role, content} turns.
 
     Returns:
-        A friendly, informative answer string.
+        A natural language string answer.
     """
-    client = Groq(api_key=settings.GROQ_API_KEY)
+    from groq import Groq
 
-    formatted = _format_results_for_llm(results)
-    user_content = (
-        f"User's request: {user_query}\n\n"
-        f"Matching projects from database:\n{formatted}"
-    )
+    if not settings.GROQ_API_KEY:
+        return "Groq API key not set. Cannot generate response."
 
-    messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+    try:
+        client = Groq(api_key=settings.GROQ_API_KEY)
+    except Exception as e:
+        logger.error(f"Failed to initialize Groq client: {e}")
+        return "Failed to initialize LLM client."
+
+    qt = search_result.get("query_type", "SEARCH").upper()
+    results = search_result.get("results", [])
+    agg = search_result.get("aggregate")
+
+    # ── Build context ──
+    if qt == "AGGREGATE" and agg:
+        context = _format_aggregate_context(agg)
+    elif qt == "DETAIL" and results:
+        context = _format_detail_context(results)
+    elif results:
+        context = _format_search_context(results)
+    else:
+        context = "No matching projects found in the database."
+
+    # ── No results fallback ──
+    if not results and not agg:
+        return (
+            "I searched through all our projects but couldn't find an exact match for your query. "
+            "Try broadening your search — for example, removing one filter like BHK count or area size. "
+            "Or ask me to show all projects in a specific city."
+        )
+
+    # Conversation context (last 4 turns)
+    history_text = ""
     if conversation_history:
-        messages.extend(conversation_history[-4:])
-    messages.append({"role": "user", "content": user_content})
+        recent = conversation_history[-4:]
+        history_text = "\nPrevious conversation:\n" + "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in recent
+        ) + "\n"
+
+    system = _PROMPTS.get(qt, _PROMPTS["SEARCH"])
+    system_prompt = system + f"\n\nData retrieved from database:\n{context}"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+    if history_text:
+        messages.append({"role": "user", "content": history_text + f"\nUser's request: {user_query}"})
+    else:
+        messages.append({"role": "user", "content": user_query})
 
     try:
         response = client.chat.completions.create(
             model=settings.GROQ_MODEL,
             messages=messages,
-            temperature=0.6,
+            temperature=0.5,
             max_tokens=1024,
         )
         answer = response.choices[0].message.content.strip()
-        logger.debug(f"Generated answer ({len(answer)} chars)")
+        logger.debug(f"Generated {qt} answer ({len(answer)} chars)")
         return answer
+
     except Exception as e:
         logger.error(f"Answer generation failed: {e}")
         return (
-            "I found some matching projects but couldn't generate a full response right now. "
+            "I found some results but had trouble generating a response right now. "
             "Please try again in a moment."
         )

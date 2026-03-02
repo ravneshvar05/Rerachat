@@ -10,7 +10,7 @@ Tests:
   3. Search — returns correct results for known queries
   4. Answer generator — writes a natural language recommendation
 """
-
+# knowldge graph
 import json
 from query_parser import parse_query
 from search import search
