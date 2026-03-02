@@ -1,0 +1,92 @@
+=== TABLES ===
+projects
+project_landmarks
+sqlite_sequence
+project_amenities
+units
+rooms
+projects_fts
+projects_fts_data
+projects_fts_idx
+projects_fts_content
+projects_fts_docsize
+projects_fts_config
+
+=== PROPERTY TYPES ===
+{'property_type': 'APARTMENT', 'cnt': 40}
+{'property_type': 'PENTHOUSE', 'cnt': 3}
+{'property_type': 'VILLA', 'cnt': 7}
+
+=== BHK VALUES ===
+{'bhk': 1, 'cnt': 3}
+{'bhk': 2, 'cnt': 26}
+{'bhk': 3, 'cnt': 5}
+{'bhk': 4, 'cnt': 11}
+{'bhk': 5, 'cnt': 5}
+
+=== NEIGHBOURHOODS (all unique) ===
+{'city': 'AHMEDABAD', 'neighbourhood': 'NARANPURA'}
+{'city': 'Ahmedabad', 'neighbourhood': None}
+{'city': 'Ahmedabad', 'neighbourhood': 'Gokuldham'}
+{'city': 'Ahmedabad', 'neighbourhood': 'Jodhpur, Satellite'}
+{'city': 'Ahmedabad', 'neighbourhood': 'Kubernagar'}
+{'city': 'Ahmedabad', 'neighbourhood': 'New Nikol - Naroda Road'}
+{'city': 'Ahmedabad', 'neighbourhood': 'Sarkhej'}
+{'city': 'Ahmedabad', 'neighbourhood': 'Science City Road'}
+{'city': 'Ahmedabad', 'neighbourhood': 'Vastral Road'}
+{'city': 'Ahmedabad', 'neighbourhood': 'Vatva - Chosar Road, Ringroad'}
+{'city': 'Ahmedabad', 'neighbourhood': 'Vinzol'}
+
+=== FTS5 landmarks sample ===
+{'project_id': 'satyamev-elysium-brochure-1', 'neighbourhood': 'Science City Road', 'landmarks_text': "Shukan Palace Bunglows Ugati Lake View Science City Circle Sardar Patel Ring Road McDonald's Avirat Circle Shyam Paradise Flats Auda Lake"}
+{'project_id': 'SKD_SuryaKutir_Ahmedabad', 'neighbourhood': 'NARANPURA', 'landmarks_text': 'BHOOMI PARTY PLOT TORRENT OFFICE AEC Circle Swaminarayan Temple May Flower Hospital Jain Upashray Kameshwor Mahadev St Kabir School St. Xaviers School Vijaynagar Cricket Ground Pallav Circle Pragatinager Circle Akhbarnagar Circle'}
+{'project_id': 'SitaramCity_Project', 'neighbourhood': 'Vastral Road', 'landmarks_text': 'Hariom Duplex Devi Krupa Society Gopi Dairy Rabari Colony Char Rasta Police Chowki Sahajanand Swaminarayan Temple (Vadhvan) Ghanshyam Complex Modhi Dehi Gopi Bungalows Samrajya Society Nirant Chokdi Kankubag Party Plot Vastral Gam'}
+{'project_id': 'swastik_harmony_brochure_1', 'neighbourhood': 'New Nikol - Naroda Road', 'landmarks_text': 'Galaxy Banglow A.M.C. Water Works Haridarsan Cross Road Swaminarayan Park Govardhan Galaxy Ganesh Vihar Daman Farm'}
+{'project_id': 'svasaar_pravesh_ahmedabad_1', 'neighbourhood': 'Vatva - Chosar Road, Ringroad', 'landmarks_text': 'Jetpur School & College Gayatri Vidyalaya - Narol Rajaram Vidhyalaya Saraswati Vidyalaya Nava Vatva Ma.Shala Riddhi Gujarati School Rajshree English School - Vatva Jan. Hospital AMTS Bus (14/1) Rickshaw Stand Isanpur Chokdi Aslali Ring Road Narol Chokdi Pauranik Swaminarayan Mandir Pauranik Baliyadev Mandir - Lambha Devimata Mandir Ranchhod Mandir Rangila Hanuman Mandir - Vatva Jain Derasar - Vatva Gayatri Mandir - Vatva Bala Hanuman Mandir - Vatva Khodiyar Mata Mandir Bank of Maharashtra Bank of India Gokul Petrol Pump Vatva Gram Panchayat Nava Vatva Gram Panchayat Super Market B/h Handloom House Natraj Cinema'}
+{'project_id': 'NEELKANTH_STATUS_KUBERNAGAR', 'neighbourhood': 'Kubernagar', 'landmarks_text': ''}
+{'project_id': 'null', 'neighbourhood': 'Jodhpur, Satellite', 'landmarks_text': "KARNAVATI CLUB S. G. ROAD BIG BAZAAR ISCON TEMPLE ISCON FLY OVER BRIDGE WIDE ANGLE DEV ARC MALL GULMOHAR PARK SATELLITE POLICE STATION RAMDEV NAGAR MARRIOT ISRO STAR BAZAAR SHYAMAL JAIN DERASAR 10C PETROL PUMP ARJUN TOWER REGENCY PLAZA RAHUL TOWER SACHIN TOWER DHANAJAYO TOWER KIRTI SAGAR PRENATIRTH DERASAR ROSEWOOD ESTATE RATNAAKAR-I RATNAAKAR-II RATNAAKAR-III RATNAAKAR-IV RATNAAKAR CALEDONIA BRTS ROAD 100'00 ROAD 132'00 RING ROAD JIVRAJ PARK SARKHEJ BOPAL THALTEJ IIM RETREAT"}
+{'project_id': 'OumOrbit_Brochure_1', 'neighbourhood': 'Vinzol', 'landmarks_text': 'Karnavati APMC Market MADHAV school Ropda Cross Road Hathijin Circle Railway Over Bridge Sardar Patel Ring Road Gamdi Cross Road Aslali Circle Narol Circle Jasoda Cross Road Vinzol Village Vatva Village Ropda Village Vishala'}
+{'project_id': 'sky_avenue_brochure', 'neighbourhood': None, 'landmarks_text': 'ANIK HOMES SONA PALACE APEX APARTMENT BEST RESIDENCY KADARI PLOT AKEERA HEIGHTS LOKHANDWALA PARK ASHIYANA GREENS AL-ARSH APARTMENT HAYAT RESIDENCY Bushra Height AJVAD APARTMENT KOH-E-TOOR RESIDENCY JENAB RESIDENCY MEEM RESIDENI Tabah AJBA RESIDENC LAXURIYA APAR'}
+{'project_id': 'AMBER_RESIDENCY_AHMEDABAD_001', 'neighbourhood': 'Sarkhej', 'landmarks_text': 'Amber Tower Kadri Party Plot Juhapura-Sarkhej Road 100 Feet Ring Road GULZAR PARK ARSHAD PARK'}
+
+=== Searching Sarkhej in FTS ===
+{'project_id': 'AMBER_RESIDENCY_AHMEDABAD_001', 'neighbourhood': 'Sarkhej'}
+{'project_id': 'null', 'neighbourhood': 'Jodhpur, Satellite'}
+{'project_id': 'KPVillas_Brochure_001', 'neighbourhood': 'Gokuldham'}
+Total: 3
+
+=== Searching Vizol/Vinzol in FTS ===
+{'project_id': 'OumOrbit_Brochure_1', 'neighbourhood': 'Vinzol'}
+Total: 1
+
+=== Searching Makarba in FTS ===
+Total: 0
+
+=== Searching Ognaj in FTS ===
+Total: 0
+
+=== Direct neighbourhood search for all areas ===
+  sarkhej: {'neighbourhood': 'Sarkhej', 'address': 'Opp. Amber Tower, B/h. Kadri Party Plot, TP 85-FP7, Subplot 2, Sarkhej Highway Road, Ahmedabad-55.'}
+  sarkhej: {'neighbourhood': 'Gokuldham', 'address': 'Near Sarkhej Gandhinagar Highway'}
+  vinzol: {'neighbourhood': 'Vinzol', 'address': 'Towards 200 ft. S.P.Ring Road, Opp. Karnavati APMC Market, Behind MADHAV school, Ropda Cross Road, Vinzol, Ahmedabad.'}
+  karnavati: {'neighbourhood': 'Vinzol', 'address': 'Towards 200 ft. S.P.Ring Road, Opp. Karnavati APMC Market, Behind MADHAV school, Ropda Cross Road, Vinzol, Ahmedabad.'}
+
+=== VILLAS in DB ===
+{'project_name': 'KP Villas', 'neighbourhood': 'Gokuldham', 'bhk': 4, 'property_type': 'VILLA'}
+{'project_name': 'KP Villas', 'neighbourhood': 'Gokuldham', 'bhk': 4, 'property_type': 'VILLA'}
+{'project_name': 'KP Villas', 'neighbourhood': 'Gokuldham', 'bhk': 4, 'property_type': 'VILLA'}
+{'project_name': 'KP Villas', 'neighbourhood': 'Gokuldham', 'bhk': 4, 'property_type': 'VILLA'}
+{'project_name': 'KP Villas', 'neighbourhood': 'Gokuldham', 'bhk': 4, 'property_type': 'VILLA'}
+{'project_name': 'KP Villas', 'neighbourhood': 'Gokuldham', 'bhk': 4, 'property_type': 'VILLA'}
+{'project_name': 'KP Villas', 'neighbourhood': 'Gokuldham', 'bhk': 5, 'property_type': 'VILLA'}
+
+=== ROW_HOUSE in DB ===
+
+=== TENEMENT in DB ===
+
+=== 3 BHK Ahmedabad units sample ===
+{'project_name': 'SURYA KUTIR', 'neighbourhood': 'NARANPURA', 'bhk': 3, 'property_type': 'APARTMENT'}
+{'project_name': 'SURYA KUTIR', 'neighbourhood': 'NARANPURA', 'bhk': 3, 'property_type': 'APARTMENT'}
+{'project_name': 'SURYA KUTIR', 'neighbourhood': 'NARANPURA', 'bhk': 3, 'property_type': 'APARTMENT'}
+{'project_name': 'Swastik Harmony', 'neighbourhood': 'New Nikol - Naroda Road', 'bhk': 3, 'property_type': 'APARTMENT'}
+{'project_name': 'Neelkanth Status', 'neighbourhood': 'Kubernagar', 'bhk': 3, 'property_type': 'APARTMENT'}

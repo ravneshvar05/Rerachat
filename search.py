@@ -70,9 +70,13 @@ def _build_sql_filter(plan: SearchPlan) -> tuple[str, list]:
         conditions.append(f"LOWER(p.city) IN ({placeholders})")
         params.extend(c.lower() for c in plan.cities)
 
+    # BHK: exact match OR minimum ("3 BHK or larger")
     if plan.bhk is not None:
         conditions.append("u.bhk = ?")
         params.append(plan.bhk)
+    elif getattr(plan, "min_bhk", None) is not None:
+        conditions.append("u.bhk >= ?")
+        params.append(plan.min_bhk)
 
     if plan.property_type:
         conditions.append("u.property_type = ?")
@@ -140,37 +144,80 @@ def sql_search(plan: SearchPlan, limit: int = 300) -> list[dict]:
 
 def fts5_search(plan: SearchPlan) -> set[str]:
     """
-    Search the FTS5 index for landmark and/or amenity queries.
+    Search the FTS5 index for location, landmark, and amenity queries.
     Returns a set of matching project_ids.
+
+    Locations are joined with OR (any location keyword matches).
+    Amenity/project_name filters are AND-ed with the location block.
+    Falls back to SQL LIKE on neighbourhood+address if FTS returns nothing for locations.
     """
-    if not plan.landmark_query and not plan.amenity_query and not plan.project_name_query:
+    if not getattr(plan, "locations", None) and not getattr(plan, "amenity_query", None) and not getattr(plan, "project_name_query", None):
         return set()
 
     conn = _get_conn()
+    parts = []
+
+    # FIX: locations use OR so "Sarkhej OR Vizol" both match
+    if getattr(plan, "locations", None):
+        safe_locs = [f'"{str(h).replace(chr(34), "")}"' for h in plan.locations]
+        parts.append(f"({' OR '.join(safe_locs)})")
+
+    if getattr(plan, "amenity_query", None):
+        aq = plan.amenity_query
+        # Guard: Groq may return a list instead of a string
+        if isinstance(aq, list):
+            aq = " ".join(str(x) for x in aq)
+        safe_amenity = str(aq).replace('"', '""')
+        parts.append(f'"{safe_amenity}"')
+
+    if getattr(plan, "project_name_query", None):
+        pnq = plan.project_name_query
+        # Guard: Groq may return a list instead of a string
+        if isinstance(pnq, list):
+            pnq = " ".join(str(x) for x in pnq)
+        safe_proj = str(pnq).replace('"', '""')
+        parts.append(f'"{safe_proj}"')
+
+    if not parts:
+        return set()
+
+    match_str = " AND ".join(parts)
+
     project_ids: set[str] = set()
+    try:
+        rows = conn.execute(
+            'SELECT project_id FROM projects_fts WHERE projects_fts MATCH ? ORDER BY rank',
+            (match_str,),
+        ).fetchall()
+        project_ids = {r["project_id"] for r in rows}
+        logger.debug(f"FTS5 matched {len(project_ids)} project(s) for query: {match_str}")
+    except Exception as e:
+        logger.warning(f"FTS5 query '{match_str}' failed: {e}")
 
-    queries = []
-    if plan.landmark_query:
-        queries.append(plan.landmark_query)
-    if plan.amenity_query:
-        queries.append(plan.amenity_query)
-    if plan.project_name_query:
-        queries.append(plan.project_name_query)
-
-    for q in queries:
-        # Sanitize for FTS5 (escape special chars)
-        safe_q = q.replace('"', '""')
+    # FIX: SQL LIKE fallback when FTS finds nothing for location queries
+    # This catches cases where neighbourhood IS in DB but not FTS-indexed correctly
+    if not project_ids and getattr(plan, "locations", None):
         try:
-            rows = conn.execute(
-                'SELECT project_id FROM projects_fts WHERE projects_fts MATCH ? ORDER BY rank',
-                (safe_q,),
-            ).fetchall()
-            for row in rows:
-                project_ids.add(row["project_id"])
+            like_conditions = []
+            like_params = []
+            for loc in plan.locations:
+                pattern = f"%{loc}%"
+                like_conditions.append(
+                    "(LOWER(p.neighbourhood) LIKE LOWER(?) OR LOWER(p.address) LIKE LOWER(?))"
+                )
+                like_params.extend([pattern, pattern])
+            like_sql = f"""
+                SELECT DISTINCT p.project_id
+                FROM projects p
+                WHERE {' OR '.join(like_conditions)}
+            """
+            rows = conn.execute(like_sql, like_params).fetchall()
+            project_ids = {r["project_id"] for r in rows}
+            if project_ids:
+                logger.debug(f"SQL LIKE fallback matched {len(project_ids)} project(s) for locations: {plan.locations}")
         except Exception as e:
-            logger.warning(f"FTS5 query '{q}' failed: {e}")
+            logger.warning(f"SQL LIKE fallback failed: {e}")
 
-    logger.debug(f"FTS5 matched {len(project_ids)} project(s)")
     return project_ids
 
 
@@ -226,6 +273,7 @@ def merge_and_group(
     sql_results: list[dict],
     fts5_project_ids: set[str],
     vector_scores: list[tuple[str, float]],
+    plan: SearchPlan,
     top_k: int = 5,
 ) -> list[dict]:
     """
@@ -245,21 +293,40 @@ def merge_and_group(
 
     scored_units: list[tuple[float, dict]] = []
 
+    requires_fts5 = bool(getattr(plan, "locations", None) or getattr(plan, "amenity_query", None) or getattr(plan, "project_name_query", None))
+    has_fts5_hits = bool(fts5_project_ids)
+
     for uid in all_unit_ids:
         unit = sql_map.get(uid)
         if unit is None:
             # Vector hit not in SQL — skip (doesn't pass hard filters)
             continue
 
+        pid = unit.get("project_id")
+
+        # FIX: If a location/amenity filter was requested AND FTS returned hits,
+        # strictly filter to only those projects.
+        # But if FTS returned 0 hits (area not in DB), don't drop everything — 
+        # let the no-results path handle it gracefully.
+        if requires_fts5 and has_fts5_hits and pid not in fts5_project_ids:
+            continue
+
         score = 0.4  # base for SQL match
 
         # FTS5 project match bonus
-        if unit.get("project_id") in fts5_project_ids:
+        if pid in fts5_project_ids:
             score += 0.3
 
         # Vector similarity
         if uid in vector_map:
             score += 0.5 * vector_map[uid]
+
+        # FIX: Only apply the 0.55 threshold when vector search ran
+        # (i.e., when we have actual similarity scores to compare).
+        # For SQL-only results (no vectors), use base threshold of 0.4.
+        min_score = 0.55 if vector_scores else 0.4
+        if score < min_score:
+            continue
 
         scored_units.append((score, unit))
 
@@ -326,7 +393,7 @@ def merge_and_group(
 def aggregate_search(plan: SearchPlan) -> dict:
     """
     Handle AGGREGATE queries without vector search.
-    Returns a summary dict with counts and breakdowns.
+    Returns a summary dict with counts AND matching project cards.
     """
     conn = _get_conn()
     where, params = _build_sql_filter(plan)
@@ -358,11 +425,22 @@ def aggregate_search(plan: SearchPlan) -> dict:
         params,
     ).fetchall()
 
+    # ── Also fetch matching project cards so the UI can render them ──
+    unit_rows = sql_search(plan, limit=200)
+    project_cards = merge_and_group(
+        sql_results=unit_rows,
+        fts5_project_ids=set(),
+        vector_scores=[],
+        plan=plan,
+        top_k=10,   # show up to 10 matching projects for aggregates
+    )
+
     return {
         "total_units":      total,
         "by_city":          [dict(r) for r in city_rows],
         "by_bhk":           [dict(r) for r in bhk_rows],
         "by_property_type": [dict(r) for r in type_rows],
+        "project_cards":    project_cards,
     }
 
 
@@ -418,6 +496,77 @@ def detail_search(plan: SearchPlan) -> list[dict]:
     return results
 
 
+# ─── Compare Query Handler ────────────────────────────────────────────────────
+
+def compare_search(plan: SearchPlan) -> list[dict]:
+    """
+    Handle COMPARE queries by finding each named project individually.
+    Uses FTS for each project name, falling back to LIKE search.
+    Returns a list of project dicts (one per named project).
+    """
+    conn = _get_conn()
+
+    # Build the list of project names to look up
+    names_to_find: list[str] = list(plan.compare_projects) if plan.compare_projects else []
+    if not names_to_find and plan.project_name_query:
+        names_to_find = [plan.project_name_query]
+
+    if not names_to_find:
+        return []
+
+    results = []
+    found_pids: set[str] = set()
+
+    for name in names_to_find:
+        pid: Optional[str] = None
+
+        # Try FTS match
+        try:
+            safe = name.replace('"', '""')
+            rows = conn.execute(
+                'SELECT project_id FROM projects_fts WHERE projects_fts MATCH ? ORDER BY rank LIMIT 1',
+                (f'"{safe}"',),
+            ).fetchall()
+            if rows:
+                pid = rows[0]["project_id"]
+        except Exception as e:
+            logger.warning(f"FTS compare search failed for '{name}': {e}")
+
+        # Fallback: LIKE on project_name
+        if not pid:
+            row = conn.execute(
+                "SELECT project_id FROM projects WHERE LOWER(project_name) LIKE ? LIMIT 1",
+                (f"%{name.lower()}%",),
+            ).fetchone()
+            if row:
+                pid = row["project_id"]
+
+        if not pid or pid in found_pids:
+            continue
+        found_pids.add(pid)
+
+        proj_row = conn.execute("SELECT * FROM projects WHERE project_id = ?", (pid,)).fetchone()
+        if not proj_row:
+            continue
+        proj = dict(proj_row)
+
+        units = conn.execute("SELECT * FROM units WHERE project_id = ?", (pid,)).fetchall()
+        proj["matching_units"] = [dict(u) for u in units]
+
+        proj["nearby_landmarks"] = [r[0] for r in conn.execute(
+            "SELECT landmark_name FROM project_landmarks WHERE project_id = ?", (pid,)
+        ).fetchall()]
+        proj["amenities"] = [r[0] for r in conn.execute(
+            "SELECT amenity FROM project_amenities WHERE project_id = ?", (pid,)
+        ).fetchall()]
+
+        proj["relevance_score"] = 1.0
+        results.append(proj)
+
+    logger.info(f"compare_search: found {len(results)} project(s) for {names_to_find}")
+    return results
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def search(plan: SearchPlan, top_k: int = 5) -> dict:
@@ -438,13 +587,19 @@ def search(plan: SearchPlan, top_k: int = 5) -> dict:
 
     if qt == "AGGREGATE":
         agg = aggregate_search(plan)
-        return {"query_type": "AGGREGATE", "results": [], "aggregate": agg}
+        # Return project cards alongside the aggregate stats so the UI renders them
+        project_cards = agg.pop("project_cards", [])
+        return {"query_type": "AGGREGATE", "results": project_cards, "aggregate": agg}
 
     if qt == "DETAIL":
         results = detail_search(plan)
         return {"query_type": "DETAIL", "results": results, "aggregate": None}
 
-    # SEARCH and COMPARE — full pipeline
+    if qt == "COMPARE":
+        results = compare_search(plan)
+        return {"query_type": "COMPARE", "results": results, "aggregate": None}
+
+    # SEARCH — full pipeline
     sql_results = sql_search(plan, limit=settings.MAX_SQL_CANDIDATES)
 
     if not sql_results:
@@ -470,5 +625,5 @@ def search(plan: SearchPlan, top_k: int = 5) -> dict:
             if row:
                 sql_results.append(dict(row))
 
-    results = merge_and_group(sql_results, fts5_hits, vector_scores, top_k=top_k)
+    results = merge_and_group(sql_results, fts5_hits, vector_scores, plan, top_k=top_k)
     return {"query_type": qt, "results": results, "aggregate": None}

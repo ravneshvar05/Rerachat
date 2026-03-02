@@ -15,7 +15,7 @@ def run_test(label, query, sleep=3):
     
     plan = plan_query(query)
     print(f"  Plan → type={plan.query_type} cities={plan.cities} bhk={plan.bhk} ptype={plan.property_type}")
-    print(f"         must_have={plan.must_have} landmark={plan.landmark_query}")
+    print(f"         must_have={plan.must_have} locations={getattr(plan, 'locations', [])}")
     
     time.sleep(sleep)
     result = search(plan)

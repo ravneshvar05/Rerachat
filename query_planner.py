@@ -33,6 +33,7 @@ class SearchPlan:
     # ── Hard SQL filters ──────────────────────────────────────────────────────
     cities: list = field(default_factory=list)          # multi-city: ["Ahmedabad","Surat"]
     bhk: Optional[int] = None
+    min_bhk: Optional[int] = None                        # for "3 BHK or larger" → bhk >= min_bhk
     property_type: Optional[str] = None                  # APARTMENT/VILLA/ROW_HOUSE/TENEMENT
     min_area_sqft: Optional[float] = None
     max_area_sqft: Optional[float] = None
@@ -49,9 +50,10 @@ class SearchPlan:
     # Any of: has_clubhouse, has_pool, has_park, has_sports_courts, has_parking
 
     # ── FTS5 text search ──────────────────────────────────────────────────────
-    landmark_query: Optional[str] = None    # "near Karnavati Club" → FTS on landmarks
+    locations: list[str] = field(default_factory=list) # "near Karnavati Club" → ["Karnavati Club"], "in Sarkhej" → ["Sarkhej"]
     amenity_query: Optional[str] = None     # "has jogging track" → FTS on amenities
     project_name_query: Optional[str] = None  # specific project name for DETAIL/COMPARE
+    compare_projects: list = field(default_factory=list)  # COMPARE: [\"OUM ORBIT\", \"KP Villas\"]
 
     # ── Semantic vector search ────────────────────────────────────────────────
     semantic_query: str = ""               # rich English phrase for ChromaDB
@@ -95,12 +97,15 @@ You are a precise real estate query planner. Convert the user's message into a s
 
 RULES:
 1. query_type:
-   - SEARCH: any property search query (most common)
-   - AGGREGATE: user wants counts or summaries ("how many", "list all", "total", "which cities")
+   - SEARCH: any property search query — including "show me", "find me", "list all", "what options" (MOST COMMON)
+   - AGGREGATE: ONLY when user explicitly asks for a COUNT or STATISTIC ("how many", "count", "total number of", "which cities have")
    - COMPARE: user explicitly wants to compare 2+ named projects
    - DETAIL: user wants full details on one specific named project
+   IMPORTANT: "list all 3 BHK apartments", "show me villas", "find me row houses" → SEARCH, not AGGREGATE.
 
 2. cities: extract all city names as a list. E.g., "Ahmedabad and Surat" → ["Ahmedabad","Surat"]
+   IMPORTANT: Only extract REAL city names (e.g., Ahmedabad, Surat, Rajkot, Vadodara).
+   Do NOT extract generic words. "in the city", "in my city", "city" → cities=[].
 
 3. must_have: list of column names from the units table that must equal 1.
    E.g., "with pooja room" → ["has_pooja_room"]
@@ -109,8 +114,8 @@ RULES:
 4. project_must_have: list of column names from the projects table that must equal 1.
    E.g., "with pool and clubhouse" → ["has_pool","has_clubhouse"]
 
-5. landmark_query: set ONLY if user mentions a specific nearby place/landmark/area.
-   E.g., "near Karnavati Club" → "Karnavati Club"
+5. locations: extract a list of ANY specific neighbourhoods, areas, or landmarks mentioned.
+   E.g., "near Karnavati Club" → ["Karnavati Club", "Sarkhej" → ["Sarkhej"], "in Sarkhej and Vizol" → ["Sarkhej", "Vizol"]
 
 6. amenity_query: set ONLY if user mentions a specific project amenity not in boolean flags.
    E.g., "with jogging track" → "jogging track"
@@ -125,20 +130,33 @@ RULES:
 
 10. For TENEMENT type queries, treat words like "tenement", "chawl", "gala" as TENEMENT.
 
+11. min_bhk: if user says "3 BHK or larger", "at least 3 BHK", "3+ BHK", "minimum 3 BHK" → set min_bhk=3, leave bhk=null.
+    If exact BHK is specified with no qualifier → set bhk=N, leave min_bhk=null.
+
+12. locations aliases: include ALL common spelling variants.
+    E.g., "Vizol" or "Vinzol" → locations=["Vizol","Vinzol"] so FTS can find either.
+    "Karnavati Club" → locations=["Karnavati Club"] (landmark search, no alias needed).
+
+13. COMPARE queries: populate compare_projects as a JSON array of EACH project name mentioned.
+    E.g., "Compare OUM ORBIT and KP Villas" → compare_projects=["OUM ORBIT", "KP Villas"]
+    Also set project_name_query to the first project name as a string.
+
 Return ONLY valid JSON matching this schema (no markdown, no extra text):
 {{
   "query_type": "SEARCH",
   "cities": [],
   "bhk": null,
+  "min_bhk": null,
   "property_type": null,
   "min_area_sqft": null,
   "max_area_sqft": null,
   "entrance_facing": null,
   "must_have": [],
   "project_must_have": [],
-  "landmark_query": null,
+  "locations": [],
   "amenity_query": null,
   "project_name_query": null,
+  "compare_projects": [],
   "semantic_query": "",
   "needs_clarification": false,
   "clarification_question": ""
@@ -152,17 +170,46 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
+# Generic words that must NOT be treated as city names
+_GENERIC_CITY_WORDS = {
+    "city", "the city", "my city", "a city", "this city", "our city",
+    "town", "the town", "locality", "area", "location",
+}
+
+
 def _parse_raw_json(raw: str, user_message: str) -> SearchPlan:
     """Parse raw JSON string into a SearchPlan."""
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
     raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
     parsed = json.loads(raw)
+
+    # Sanitize cities: strip generic words that are not real city names
+    if "cities" in parsed and isinstance(parsed["cities"], list):
+        parsed["cities"] = [
+            c for c in parsed["cities"]
+            if c and c.strip().lower() not in _GENERIC_CITY_WORDS
+        ]
+
+    # Sanitize string fields that Groq may incorrectly return as a list
+    for field_name in ("project_name_query", "amenity_query", "semantic_query"):
+        val = parsed.get(field_name)
+        if isinstance(val, list):
+            parsed[field_name] = " ".join(str(x) for x in val) if val else None
+
+    # If COMPARE and compare_projects not set, try to auto-extract from project_name_query
+    if parsed.get("query_type") == "COMPARE":
+        cp = parsed.get("compare_projects", [])
+        pnq = parsed.get("project_name_query") or ""
+        if not cp and pnq:
+            # project_name_query may contain both names separated by space/and
+            parsed["compare_projects"] = [pnq]
+
     valid_fields = SearchPlan.__dataclass_fields__
     filtered = {k: v for k, v in parsed.items() if k in valid_fields}
     plan = SearchPlan(**filtered)
     logger.debug(
         f"SearchPlan: type={plan.query_type} cities={plan.cities} "
-        f"bhk={plan.bhk} ptype={plan.property_type} must={plan.must_have}"
+        f"bhk={plan.bhk} min_bhk={getattr(plan, 'min_bhk', None)} ptype={plan.property_type} must={plan.must_have}"
     )
     return plan
 
