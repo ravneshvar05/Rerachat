@@ -3,6 +3,7 @@ answer_generator.py — Uses Groq LLM to generate a natural language response
 based on the search results and the user's original query.
 """
 
+import json
 from groq import Groq
 from config import settings
 from logger import logger
@@ -38,6 +39,8 @@ def _format_results_for_llm(results: list[dict]) -> str:
     for i, p in enumerate(results, 1):
         lines.append(f"[Project {i}] {p.get('project_name')} by {p.get('developer_name')}")
         lines.append(f"  Location: {p.get('city')}, {p.get('neighbourhood') or ''}")
+        if p.get("nearby_landmarks"):
+            lines.append(f"  Nearby Landmarks: {p.get('nearby_landmarks')}")
         
         # Amenities summary
         amenities = []
@@ -70,6 +73,19 @@ def _format_results_for_llm(results: list[dict]) -> str:
                 unit_line += f"| Features: {', '.join(features)}"
                 
             lines.append(unit_line)
+
+            # Extra room dimensions
+            if u.get("rooms_json"):
+                try:
+                    rooms = json.loads(u["rooms_json"])
+                    valid_rooms = []
+                    for r in rooms:
+                        if r.get('name') and r.get('length') and r.get('width'):
+                            valid_rooms.append(f"{r['name']} ({r['length']}x{r['width']})")
+                    if valid_rooms:
+                        lines.append(f"      Rooms: {', '.join(valid_rooms)}")
+                except:
+                    pass
 
         lines.append("")   # blank line between projects
     return "\n".join(lines)

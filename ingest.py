@@ -39,6 +39,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             developer_name      TEXT,
             city                TEXT,
             neighbourhood       TEXT,
+            nearby_landmarks    TEXT,   -- joined string of landmarks
             rera_number         TEXT,
             project_status      TEXT,
             possession_date     TEXT,
@@ -63,6 +64,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             wash_area_sqft      REAL,
             applicable_buildings TEXT,      -- stored as comma-separated string
             description         TEXT,
+            rooms_json          TEXT,       -- raw JSON generic room details
             -- derived room flags (for fast filtering)
             has_pooja_room      INTEGER DEFAULT 0,
             has_study_room      INTEGER DEFAULT 0,
@@ -207,7 +209,7 @@ def ingest_project(
     conn.execute(
         """INSERT INTO projects VALUES (
             :project_id, :project_name, :developer_name, :city, :neighbourhood,
-            :rera_number, :project_status, :possession_date, :amenities_text,
+            :nearby_landmarks, :rera_number, :project_status, :possession_date, :amenities_text,
             :has_clubhouse, :has_pool, :has_park, :has_sports_courts,
             :has_parking, :total_units
         )""",
@@ -217,6 +219,7 @@ def ingest_project(
             "developer_name":  data.get("developer_name"),
             "city":            loc.get("city"),
             "neighbourhood":   loc.get("neighbourhood"),
+            "nearby_landmarks": ", ".join(loc.get("nearby_landmarks") or []),
             "rera_number":     data.get("rera_registration_number"),
             "project_status":  data.get("project_status"),
             "possession_date": data.get("possession_date"),
@@ -246,7 +249,7 @@ def ingest_project(
             """INSERT OR IGNORE INTO units VALUES (
                 :unit_id, :project_id, :unit_type, :property_type, :bhk,
                 :carpet_area_sqft, :super_builtup_sqft, :balcony_area_sqft,
-                :wash_area_sqft, :applicable_buildings, :description,
+                :wash_area_sqft, :applicable_buildings, :description, :rooms_json,
                 :has_pooja_room, :has_study_room, :has_terrace,
                 :has_servant_room, :has_garden, :has_home_theatre, :has_gym,
                 :attached_bathrooms, :total_rooms
@@ -263,6 +266,7 @@ def ingest_project(
                 "wash_area_sqft":      unit.get("wash_area_sqft"),
                 "applicable_buildings": ",".join(unit.get("applicable_buildings") or []),
                 "description":         unit.get("description"),
+                "rooms_json":          json.dumps(unit.get("rooms", [])),
                 **flags,
             },
         )
