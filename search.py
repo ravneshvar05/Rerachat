@@ -134,6 +134,10 @@ def sql_search(plan: SearchPlan, limit: int = 300) -> list[dict]:
         FROM units u
         JOIN projects p ON u.project_id = p.project_id
         {where}
+        ORDER BY
+            CASE WHEN p.city IS NOT NULL THEN 0 ELSE 1 END,
+            CASE WHEN u.bhk IS NOT NULL THEN 0 ELSE 1 END,
+            u.bhk ASC
         LIMIT {limit}
     """
     conn = _get_conn()

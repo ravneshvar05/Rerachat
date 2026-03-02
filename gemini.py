@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from typing import Optional
 from pathlib import Path
@@ -154,6 +155,11 @@ class BrochureData(BaseModel):
 
 MODEL = "gemini-2.5-flash"
 
+# Number of PDFs to process in parallel.
+# 4 is conservative and stays within Gemini Flash rate limits.
+# Increase to 8 if you have a higher-tier API quota.
+MAX_WORKERS = 4
+
 # A highly specific prompt to guide the LLM through complex real estate nuances
 PROMPT = """
 You are an expert real estate architect and data extraction AI. 
@@ -207,40 +213,75 @@ def process_pdf(client: genai.Client, pdf_path: Path) -> str | None:
         logging.error(f"  API call failed: {str(e)[:300]}")
         return None
 
+def _process_one(api_key: str, pdf_path: Path, output_dir: Path, idx: int, total: int) -> bool:
+    """
+    Worker function called by each thread.
+    Creates its own Gemini client (thread-safe — each thread has its own HTTP session).
+    Returns True on success, False on failure.
+    """
+    logging.info(f"--- [{idx}/{total}] Processing: {pdf_path.name} ---")
+    try:
+        client = genai.Client(api_key=api_key)
+        result = process_pdf(client, pdf_path)
+        if result:
+            out_file = output_dir / f"{pdf_path.stem}.json"
+            out_file.write_text(result, encoding="utf-8")
+            logging.info(f"  SAVED -> {out_file}")
+            return True
+        else:
+            logging.error(f"  SKIPPED (empty response): {pdf_path.name}")
+            return False
+    except Exception as e:
+        logging.error(f"  FAILED: {pdf_path.name} — {e}")
+        return False
+
+
 def main():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         logging.error("GEMINI_API_KEY not found in .env file.")
         return
 
-    client = genai.Client(api_key=api_key)
-
     input_dir = Path("data")
     output_dir = Path("output")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    pdf_files = list(input_dir.glob("*.pdf"))
+    # Skip PDFs that already have a JSON output (idempotent re-runs)
+    pdf_files = [
+        p for p in sorted(input_dir.glob("*.pdf"))
+        if not (output_dir / f"{p.stem}.json").exists()
+    ]
 
     if not pdf_files:
-        logging.warning("No PDFs found in the 'data' folder.")
+        logging.info("No new PDFs to process (all already have JSON output).")
         return
 
-    logging.info(f"Found {len(pdf_files)} PDF(s).")
+    total = len(pdf_files)
+    logging.info(f"Found {total} new PDF(s) to process (workers={MAX_WORKERS}).")
+
     success_count = 0
+    fail_count = 0
 
-    for idx, pdf_path in enumerate(pdf_files):
-        logging.info(f"--- [{idx+1}/{len(pdf_files)}] Processing: {pdf_path.name} ---")
-        result = process_pdf(client, pdf_path)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all PDFs; track future → pdf_path for error reporting
+        future_to_pdf = {
+            executor.submit(_process_one, api_key, pdf_path, output_dir, idx + 1, total): pdf_path
+            for idx, pdf_path in enumerate(pdf_files)
+        }
 
-        if result:
-            out_file = output_dir / f"{pdf_path.stem}.json"
-            out_file.write_text(result, encoding="utf-8")
-            logging.info(f"  SAVED -> {out_file}")
-            success_count += 1
-        else:
-            logging.error(f"  SKIPPED: {pdf_path.name}")
+        for future in as_completed(future_to_pdf):
+            pdf_path = future_to_pdf[future]
+            try:
+                ok = future.result()
+                if ok:
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as exc:
+                logging.error(f"  Unhandled error for {pdf_path.name}: {exc}")
+                fail_count += 1
 
-    logging.info(f"Done! {success_count}/{len(pdf_files)} saved.")
+    logging.info(f"Done! {success_count}/{total} saved, {fail_count} failed.")
 
 if __name__ == "__main__":
     main()

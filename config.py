@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     INGEST_BATCH_SIZE: int = Field(50, description="ChromaDB upsert batch size")
 
     # ── Search ────────────────────────────────────────────────────────────────
-    MAX_SQL_CANDIDATES: int = Field(300, description="Max rows from SQL before vector rerank")
+    MAX_SQL_CANDIDATES: int = Field(1000, description="Max rows from SQL before vector rerank")
     MAX_VECTOR_RESULTS: int = Field(50,  description="Max results from ChromaDB")
     DEFAULT_TOP_K: int = Field(5,        description="Default top-K projects to return")
 
