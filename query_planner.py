@@ -95,6 +95,19 @@ You are a precise real estate query planner. Convert the user's message into a s
 
 {_SCHEMA_CONTEXT}
 
+PROPERTY TYPE VOCABULARY (CRITICAL — always apply before setting property_type):
+Map the user's words to the EXACT enum value. Use the table below:
+
+  ROW_HOUSE  ← raw house, rawhouse, row house, row-house,
+                bungalow, bunglow, banglow, bangalow, kothi, independent house
+  VILLA      ← villa, villas, luxury villa, duplex villa, twin villa, farmhouse, villa bungalow
+  APARTMENT  ← apartment, flat, flats, unit, studio, studio apartment
+  TENEMENT   ← tenement, tenaments, tenements, chawl, chawls, gala, galas, old style flat
+  PENTHOUSE  ← penthouse, penthouses, sky villa, sky apartment, rooftop apartment
+
+If NONE of the above specific property words are spoken, set property_type = null.
+Generic words like "house", "houses", "home", "homes", or "property" alone MUST map to null.
+
 RULES:
 1. query_type:
    - SEARCH: any property search query — including "show me", "find me", "list all", "what options" (MOST COMMON)
@@ -104,8 +117,9 @@ RULES:
    IMPORTANT: "list all 3 BHK apartments", "show me villas", "find me row houses" → SEARCH, not AGGREGATE.
 
 2. cities: extract all city names as a list. E.g., "Ahmedabad and Surat" → ["Ahmedabad","Surat"]
-   IMPORTANT: Only extract REAL city names (e.g., Ahmedabad, Surat, Rajkot, Vadodara).
-   Do NOT extract generic words. "in the city", "in my city", "city" → cities=[].
+   IMPORTANT: Only extract REAL Indian city names (e.g., Ahmedabad, Surat, Rajkot, Vadodara, Gandhinagar).
+   Do NOT extract generic words or locality names. "in the city", "my city", "Sun City" → cities=[].
+   "Sun City", "Sarkhej", "Bopal", "Vizol" are LOCALITIES, not cities → put them in locations[], not cities[].
 
 3. must_have: list of column names from the units table that must equal 1.
    E.g., "with pooja room" → ["has_pooja_room"]
@@ -114,8 +128,13 @@ RULES:
 4. project_must_have: list of column names from the projects table that must equal 1.
    E.g., "with pool and clubhouse" → ["has_pool","has_clubhouse"]
 
-5. locations: extract a list of ANY specific neighbourhoods, areas, or landmarks mentioned.
-   E.g., "near Karnavati Club" → ["Karnavati Club", "Sarkhej" → ["Sarkhej"], "in Sarkhej and Vizol" → ["Sarkhej", "Vizol"]
+5. locations: extract a list of ANY specific neighbourhoods, areas, societies, or landmarks mentioned.
+   E.g., "near Karnavati Club" → ["Karnavati Club"]
+   "in Sarkhej" → ["Sarkhej"]
+   "near Sun City" → ["Sun City"]
+   "in Sarkhej and Vizol" → ["Sarkhej", "Vizol"]
+   Include ALL common spelling variants as separate entries when ambiguous.
+   E.g., "Vizol" or "Vinzol" → locations=["Vizol","Vinzol"]
 
 6. amenity_query: set ONLY if user mentions a specific project amenity not in boolean flags.
    E.g., "with jogging track" → "jogging track"
@@ -127,17 +146,12 @@ RULES:
    Never ask for clarification on aggregation queries or partial queries.
 
 9. property_type must be exactly one of: APARTMENT, VILLA, ROW_HOUSE, TENEMENT, PENTHOUSE, null
+   Refer to the PROPERTY TYPE VOCABULARY table at the top — always use that mapping.
 
-10. For TENEMENT type queries, treat words like "tenement", "chawl", "gala" as TENEMENT.
-
-11. min_bhk: if user says "3 BHK or larger", "at least 3 BHK", "3+ BHK", "minimum 3 BHK" → set min_bhk=3, leave bhk=null.
+10. min_bhk: if user says "3 BHK or larger", "at least 3 BHK", "3+ BHK", "minimum 3 BHK" → set min_bhk=3, leave bhk=null.
     If exact BHK is specified with no qualifier → set bhk=N, leave min_bhk=null.
 
-12. locations aliases: include ALL common spelling variants.
-    E.g., "Vizol" or "Vinzol" → locations=["Vizol","Vinzol"] so FTS can find either.
-    "Karnavati Club" → locations=["Karnavati Club"] (landmark search, no alias needed).
-
-13. COMPARE queries: populate compare_projects as a JSON array of EACH project name mentioned.
+11. COMPARE queries: populate compare_projects as a JSON array of EACH project name mentioned.
     E.g., "Compare OUM ORBIT and KP Villas" → compare_projects=["OUM ORBIT", "KP Villas"]
     Also set project_name_query to the first project name as a string.
 

@@ -177,13 +177,20 @@ st.markdown("""
   }
 
   /* Input */
-  .stChatInputContainer > div {
-    background: rgba(30, 41, 59, 0.9) !important;
-    border: 1px solid rgba(99,102,241,0.3) !important;
-    border-radius: 30px !important;
+  [data-testid="stChatInput"] {
+    background: transparent !important;
+  }
+  .stChatInputContainer {
+    background: #1e293b !important;
+    border: 1px solid rgba(99,102,241,0.4) !important;
+    border-radius: 24px !important;
+  }
+  .stChatInputContainer:focus-within {
+    border-color: rgba(139,92,246,0.8) !important;
+    box-shadow: 0 0 15px rgba(139,92,246,0.2) !important;
   }
   .stChatInputContainer textarea {
-    color: #e2e8f0 !important;
+    color: #f1f5f9 !important;
   }
 
   /* Sidebar */

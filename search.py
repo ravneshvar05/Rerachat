@@ -60,6 +60,9 @@ PROJECT_FLAG_COLUMNS = {
     "has_clubhouse", "has_pool", "has_park", "has_sports_courts", "has_parking",
 }
 
+# Property types that are considered "non-apartment" for fallback logic
+NON_APARTMENT_TYPES = {"VILLA", "ROW_HOUSE", "TENEMENT", "PENTHOUSE"}
+
 
 def _build_sql_filter(plan: SearchPlan) -> tuple[str, list]:
     conditions, params = [], []
@@ -567,6 +570,32 @@ def compare_search(plan: SearchPlan) -> list[dict]:
     return results
 
 
+# ─── Non-Apartment Fallback Helper ───────────────────────────────────────────
+
+def _search_non_apartment(plan: SearchPlan, top_k: int = 5) -> list[dict]:
+    """
+    Fallback search when a specific non-apartment type returns 0 results.
+    Broadens to ALL non-apartment types (VILLA, ROW_HOUSE, TENEMENT, PENTHOUSE)
+    while keeping city, BHK, location and other filters intact.
+    """
+    import copy
+    fallback_plan = copy.copy(plan)
+    fallback_plan.property_type = None  # Remove the tight type filter
+
+    sql_results = sql_search(fallback_plan, limit=settings.MAX_SQL_CANDIDATES)
+
+    # Keep only non-apartment rows
+    sql_results = [r for r in sql_results if r.get("property_type", "").upper() != "APARTMENT"]
+
+    if not sql_results:
+        return []
+
+    fts5_hits = fts5_search(fallback_plan)
+    vector_scores = vector_search(fallback_plan, top_k=settings.MAX_VECTOR_RESULTS)
+
+    return merge_and_group(sql_results, fts5_hits, vector_scores, fallback_plan, top_k=top_k)
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def search(plan: SearchPlan, top_k: int = 5) -> dict:
@@ -576,30 +605,35 @@ def search(plan: SearchPlan, top_k: int = 5) -> dict:
     Returns:
         {
           "query_type": "SEARCH" | "AGGREGATE" | "COMPARE" | "DETAIL",
-          "results": [...]     # list of project dicts for SEARCH/COMPARE/DETAIL
-          "aggregate": {...}   # summary dict for AGGREGATE
+          "results": [...]          # list of project dicts for SEARCH/COMPARE/DETAIL
+          "aggregate": {...}        # summary dict for AGGREGATE
+          "fallback_non_apt": bool  # True if results are a non-apt fallback
+          "original_type": str      # the originally requested type (e.g. "TENEMENT")
         }
     """
     if plan.needs_clarification:
-        return {"query_type": "SEARCH", "results": [], "aggregate": None}
+        return {"query_type": "SEARCH", "results": [], "aggregate": None,
+                "fallback_non_apt": False, "original_type": None}
 
     qt = plan.query_type.upper()
 
     if qt == "AGGREGATE":
         agg = aggregate_search(plan)
-        # Return project cards alongside the aggregate stats so the UI renders them
         project_cards = agg.pop("project_cards", [])
-        return {"query_type": "AGGREGATE", "results": project_cards, "aggregate": agg}
+        return {"query_type": "AGGREGATE", "results": project_cards, "aggregate": agg,
+                "fallback_non_apt": False, "original_type": None}
 
     if qt == "DETAIL":
         results = detail_search(plan)
-        return {"query_type": "DETAIL", "results": results, "aggregate": None}
+        return {"query_type": "DETAIL", "results": results, "aggregate": None,
+                "fallback_non_apt": False, "original_type": None}
 
     if qt == "COMPARE":
         results = compare_search(plan)
-        return {"query_type": "COMPARE", "results": results, "aggregate": None}
+        return {"query_type": "COMPARE", "results": results, "aggregate": None,
+                "fallback_non_apt": False, "original_type": None}
 
-    # SEARCH — full pipeline
+    # ── SEARCH — full pipeline ────────────────────────────────────────────────
     sql_results = sql_search(plan, limit=settings.MAX_SQL_CANDIDATES)
 
     if not sql_results:
@@ -626,4 +660,29 @@ def search(plan: SearchPlan, top_k: int = 5) -> dict:
                 sql_results.append(dict(row))
 
     results = merge_and_group(sql_results, fts5_hits, vector_scores, plan, top_k=top_k)
-    return {"query_type": qt, "results": results, "aggregate": None}
+
+    # ── Non-apartment fallback ────────────────────────────────────────────────
+    # If the user asked for a specific non-apartment type but got 0 results,
+    # broaden to ALL non-apartment types so we never return an empty hand.
+    original_type = plan.property_type.upper() if plan.property_type else None
+    if not results and original_type and original_type in NON_APARTMENT_TYPES:
+        logger.info(
+            f"No results for {original_type} — broadening to all non-apartment types."
+        )
+        results = _search_non_apartment(plan, top_k=top_k)
+        if results:
+            return {
+                "query_type": qt,
+                "results": results,
+                "aggregate": None,
+                "fallback_non_apt": True,
+                "original_type": original_type,
+            }
+
+    return {
+        "query_type": qt,
+        "results": results,
+        "aggregate": None,
+        "fallback_non_apt": False,
+        "original_type": original_type,
+    }

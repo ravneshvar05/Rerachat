@@ -244,6 +244,21 @@ def generate_answer(
             "Or ask me to show all projects in a specific city."
         )
 
+    # ── Non-apartment fallback note ──
+    fallback_non_apt = search_result.get("fallback_non_apt", False)
+    original_type = search_result.get("original_type") or ""
+    fallback_note = ""
+    if fallback_non_apt and original_type:
+        type_display = original_type.replace("_", " ").title()  # e.g. "Row House"
+        fallback_note = (
+            f"\n\nIMPORTANT CONTEXT: The user asked for a '{type_display}' specifically, "
+            f"but NO {type_display} listings were found in the database for their location/filters. "
+            f"The results below are the BEST AVAILABLE non-apartment alternatives "
+            f"(Villas, Row Houses, Tenements, Penthouses) that match their other criteria. "
+            f"You MUST clearly tell the user upfront: 'I couldn't find any {type_display}s matching your "
+            f"criteria, but here are the best non-apartment options available:'"
+        )
+
     # Conversation context (last 4 turns)
     history_text = ""
     if conversation_history:
@@ -253,7 +268,7 @@ def generate_answer(
         ) + "\n"
 
     system = _PROMPTS.get(qt, _PROMPTS["SEARCH"])
-    system_prompt = system + f"\n\nData retrieved from database:\n{context}"
+    system_prompt = system + f"\n\nData retrieved from database:\n{context}{fallback_note}"
 
     messages = [
         {"role": "system", "content": system_prompt},
